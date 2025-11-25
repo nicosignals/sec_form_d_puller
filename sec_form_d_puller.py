@@ -164,7 +164,7 @@ def get_filings_from_daily_index(start_date: datetime, end_date: datetime) -> li
         quarter = (current_date.month - 1) // 3 + 1
         
         # Try multiple index URL formats
-        date_str = current_date.strftime('%Y%m%d')
+        date_str = current_date.strftime('%y%m%d')  # Changed from '%Y%m%d'
         index_urls = [
             f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/form.{date_str}.idx",
             f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/master.{date_str}.idx",
