@@ -84,39 +84,63 @@ def get_filings_from_efts(start_date: datetime, end_date: datetime, headers: dic
     # EFTS search endpoint
     search_url = "https://efts.sec.gov/LATEST/search-index"
     
+    # Correct payload format for EFTS
     payload = {
-        "q": "*",
+        "q": "formType:\"D\" OR formType:\"D/A\"",
         "dateRange": "custom",
         "startdt": start_date.strftime("%Y-%m-%d"),
         "enddt": end_date.strftime("%Y-%m-%d"),
-        "forms": ["D", "D/A"],
-        "from": "0",
-        "size": "200"
+        "from": 0,
+        "size": 200
     }
     
-    response = requests.post(
-        search_url,
-        json=payload,
-        headers={**headers, "Content-Type": "application/json"},
-        timeout=60
-    )
-    
-    if response.status_code != 200:
-        raise Exception(f"EFTS returned {response.status_code}")
-    
-    data = response.json()
-    hits = data.get("hits", {}).get("hits", [])
-    
-    for hit in hits:
-        source = hit.get("_source", {})
-        filings.append({
-            'company_name': source.get("display_names", ["Unknown"])[0] if source.get("display_names") else "Unknown",
-            'form_type': source.get("form", "D"),
-            'cik': str(source.get("ciks", [""])[0]) if source.get("ciks") else "",
-            'date_filed': source.get("file_date", ""),
-            'filename': source.get("file_name", ""),
-            'accession_number': source.get("adsh", "")
-        })
+    try:
+        response = requests.post(
+            search_url,
+            json=payload,
+            headers={**headers, "Content-Type": "application/json"},
+            timeout=60
+        )
+        
+        if response.status_code != 200:
+            logger.warning(f"EFTS returned {response.status_code}: {response.text[:200]}")
+            raise Exception(f"EFTS returned {response.status_code}")
+        
+        data = response.json()
+        hits = data.get("hits", {}).get("hits", [])
+        
+        logger.info(f"EFTS returned {len(hits)} hits")
+        
+        for hit in hits:
+            source = hit.get("_source", {})
+            
+            # Extract company name
+            display_names = source.get("display_names", [])
+            company_name = display_names[0] if display_names else "Unknown"
+            
+            # Extract CIK
+            ciks = source.get("ciks", [])
+            cik = str(ciks[0]) if ciks else ""
+            
+            # Extract filename from _id (format: accession:filename)
+            file_id = hit.get("_id", "")
+            accession = ""
+            if ":" in file_id:
+                parts = file_id.split(":")
+                accession = parts[0]
+            
+            filings.append({
+                'company_name': company_name,
+                'form_type': source.get("form", "D"),
+                'cik': cik,
+                'date_filed': source.get("file_date", ""),
+                'filename': source.get("file_name", ""),
+                'accession_number': accession
+            })
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"EFTS request failed: {e}")
+        raise
     
     return filings
 
@@ -139,17 +163,27 @@ def get_filings_from_daily_index(start_date: datetime, end_date: datetime) -> li
         year = current_date.year
         quarter = (current_date.month - 1) // 3 + 1
         
-        # Try daily index first
-        index_url = f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/form.{current_date.strftime('%Y%m%d')}.idx"
+        # Try multiple index URL formats
+        date_str = current_date.strftime('%Y%m%d')
+        index_urls = [
+            f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/form.{date_str}.idx",
+            f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/master.{date_str}.idx",
+        ]
         
-        try:
-            response = requests.get(index_url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                filings.extend(parse_index_file(response.text, current_date))
-            else:
-                logger.warning(f"No index for {current_date.strftime('%Y-%m-%d')}: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Error fetching index for {current_date}: {e}")
+        for index_url in index_urls:
+            try:
+                logger.debug(f"Trying: {index_url}")
+                response = requests.get(index_url, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    day_filings = parse_index_file(response.text, current_date)
+                    if day_filings:
+                        logger.info(f"Found {len(day_filings)} Form D filings for {current_date.strftime('%Y-%m-%d')}")
+                        filings.extend(day_filings)
+                    break  # Success, move to next date
+                else:
+                    logger.debug(f"Index returned {response.status_code}: {index_url}")
+            except Exception as e:
+                logger.debug(f"Error fetching {index_url}: {e}")
         
         # Rate limiting - SEC allows 10 requests/second
         time.sleep(0.15)
