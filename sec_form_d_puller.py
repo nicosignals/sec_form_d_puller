@@ -312,14 +312,13 @@ def fetch_form_d_details(filing: dict) -> Optional[dict]:
             return None
         
         # Find XML file in index (skip xsl transformed versions)
-        # First try to find primary_doc.xml without xsl path
-        xml_match = re.search(r'href="([^"]*(?<!xsl[^/]*)/primary_doc\.xml)"', response.text, re.IGNORECASE)
-        if not xml_match:
-            # Fall back to any XML file that's not in an xsl folder
-            for match in re.finditer(r'href="([^"]+\.xml)"', response.text, re.IGNORECASE):
-                if 'xsl' not in match.group(1).lower():
-                    xml_match = match
-                    break
+        xml_match = None
+        for match in re.finditer(r'href="([^"]+\.xml)"', response.text, re.IGNORECASE):
+            xml_path = match.group(1)
+            # Skip XSLT transformed versions
+            if '/xsl' not in xml_path.lower():
+                xml_match = match
+                break
         
         if xml_match:
             xml_filename = xml_match.group(1)
