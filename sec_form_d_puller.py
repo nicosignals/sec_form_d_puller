@@ -311,11 +311,23 @@ def fetch_form_d_details(filing: dict) -> Optional[dict]:
             
             return None
         
-        # Find XML file in index
-        xml_match = re.search(r'href="([^"]+\.xml)"', response.text, re.IGNORECASE)
+        # Find XML file in index (skip xsl transformed versions)
+        # First try to find primary_doc.xml without xsl path
+        xml_match = re.search(r'href="([^"]*(?<!xsl[^/]*)/primary_doc\.xml)"', response.text, re.IGNORECASE)
+        if not xml_match:
+            # Fall back to any XML file that's not in an xsl folder
+            for match in re.finditer(r'href="([^"]+\.xml)"', response.text, re.IGNORECASE):
+                if 'xsl' not in match.group(1).lower():
+                    xml_match = match
+                    break
+        
         if xml_match:
             xml_filename = xml_match.group(1)
-            xml_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{xml_filename}"
+            # Handle absolute vs relative paths
+            if xml_filename.startswith('/'):
+                xml_url = f"https://www.sec.gov{xml_filename}"
+            else:
+                xml_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{xml_filename}"
             
             xml_response = requests.get(xml_url, headers=headers, timeout=30)
             time.sleep(0.15)
