@@ -65,11 +65,11 @@ def get_recent_form_d_filings(days_back: int = 1) -> list[dict]:
     except Exception as e:
         logger.warning(f"EFTS API failed: {e}, falling back to daily index")
     
-    # Method 2: Fall back to daily index
+    # Method 2: Fall back to full-index (quarterly master files)
     try:
-        filings = get_filings_from_daily_index(start_date, end_date)
+        filings = get_filings_from_full_index(start_date, end_date)
     except Exception as e:
-        logger.error(f"Daily index also failed: {e}")
+        logger.error(f"Full-index also failed: {e}")
     
     return filings
 
@@ -145,62 +145,64 @@ def get_filings_from_efts(start_date: datetime, end_date: datetime, headers: dic
     return filings
 
 
-def get_filings_from_daily_index(start_date: datetime, end_date: datetime) -> list[dict]:
+def get_filings_from_full_index(start_date: datetime, end_date: datetime) -> list[dict]:
     """
-    Get Form D filings from SEC daily index files.
-    More reliable than search API for automated daily pulls.
+    Get Form D filings from SEC full-index quarterly master files.
+    Uses https://www.sec.gov/Archives/edgar/full-index/YYYY/QTR#/master.idx
+    which is publicly accessible (unlike daily-index which returns 403).
     """
     filings = []
     headers = {"User-Agent": SEC_USER_AGENT}
     
-    current_date = start_date
-    while current_date <= end_date:
-        # Skip weekends
-        if current_date.weekday() >= 5:
-            current_date += timedelta(days=1)
-            continue
+    # Determine which quarters we need to fetch
+    quarters_needed = set()
+    current = start_date
+    while current <= end_date:
+        year = current.year
+        quarter = (current.month - 1) // 3 + 1
+        quarters_needed.add((year, quarter))
+        current += timedelta(days=32)  # Jump roughly a month
+    
+    # Also add the end date's quarter in case we missed it
+    end_year = end_date.year
+    end_quarter = (end_date.month - 1) // 3 + 1
+    quarters_needed.add((end_year, end_quarter))
+    
+    logger.info(f"Fetching full-index for quarters: {sorted(quarters_needed)}")
+    
+    for year, quarter in sorted(quarters_needed):
+        index_url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
+        
+        try:
+            logger.info(f"Fetching: {index_url}")
+            response = requests.get(index_url, headers=headers, timeout=60)
             
-        year = current_date.year
-        quarter = (current_date.month - 1) // 3 + 1
+            if response.status_code == 200:
+                # Parse the index and filter by date range
+                quarter_filings = parse_full_index(response.text, start_date, end_date)
+                logger.info(f"Found {len(quarter_filings)} Form D filings in {year} Q{quarter} within date range")
+                filings.extend(quarter_filings)
+            else:
+                logger.warning(f"Full-index returned {response.status_code}: {index_url}")
+                
+        except Exception as e:
+            logger.error(f"Error fetching {index_url}: {e}")
         
-        # Try multiple index URL formats
-        date_str = current_date.strftime('%y%m%d')  # Changed from '%Y%m%d'
-        index_urls = [
-            f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/form.{date_str}.idx",
-            f"https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{quarter}/master.{date_str}.idx",
-        ]
-        
-        for index_url in index_urls:
-            try:
-                logger.debug(f"Trying: {index_url}")
-                response = requests.get(index_url, headers=headers, timeout=30)
-                if response.status_code == 200:
-                    day_filings = parse_index_file(response.text, current_date)
-                    if day_filings:
-                        logger.info(f"Found {len(day_filings)} Form D filings for {current_date.strftime('%Y-%m-%d')}")
-                        filings.extend(day_filings)
-                    break  # Success, move to next date
-                else:
-                    logger.debug(f"Index returned {response.status_code}: {index_url}")
-            except Exception as e:
-                logger.debug(f"Error fetching {index_url}: {e}")
-        
-        # Rate limiting - SEC allows 10 requests/second
-        time.sleep(0.15)
-        current_date += timedelta(days=1)
+        # Rate limiting
+        time.sleep(0.2)
     
     return filings
 
 
-def parse_index_file(index_content: str, file_date: datetime) -> list[dict]:
+def parse_full_index(index_content: str, start_date: datetime, end_date: datetime) -> list[dict]:
     """
-    Parse SEC index file and extract Form D filings.
-    Index format: Company Name|Form Type|CIK|Date Filed|Filename
+    Parse SEC full-index master.idx file and extract Form D filings within date range.
+    Format: CIK|Company Name|Form Type|Date Filed|Filename
     """
     filings = []
     lines = index_content.split('\n')
     
-    # Skip header lines (usually first 9-11 lines)
+    # Skip header lines until we hit the separator
     data_started = False
     for line in lines:
         if line.startswith('-----'):
@@ -210,22 +212,36 @@ def parse_index_file(index_content: str, file_date: datetime) -> list[dict]:
         if not data_started or not line.strip():
             continue
         
-        # Parse pipe-delimited or fixed-width format
-        # Format varies but typically: Company|Form|CIK|Date|Filename
-        parts = line.split('|') if '|' in line else re.split(r'\s{2,}', line)
+        # Parse pipe-delimited format
+        parts = line.split('|')
         
         if len(parts) >= 5:
-            form_type = parts[1].strip() if len(parts) > 1 else ""
+            cik = parts[0].strip()
+            company_name = parts[1].strip()
+            form_type = parts[2].strip()
+            date_filed = parts[3].strip()
+            filename = parts[4].strip()
             
             # Only process Form D and D/A
-            if form_type in ['D', 'D/A']:
-                filings.append({
-                    'company_name': parts[0].strip(),
-                    'form_type': form_type,
-                    'cik': parts[2].strip().lstrip('0'),
-                    'date_filed': parts[3].strip(),
-                    'filename': parts[4].strip() if len(parts) > 4 else ""
-                })
+            if form_type not in ['D', 'D/A']:
+                continue
+            
+            # Parse date and check if within range
+            try:
+                filing_date = datetime.strptime(date_filed, '%Y-%m-%d')
+                if filing_date < start_date or filing_date > end_date:
+                    continue
+            except ValueError:
+                continue
+            
+            filings.append({
+                'company_name': company_name,
+                'form_type': form_type,
+                'cik': cik,
+                'date_filed': date_filed,
+                'filename': filename,
+                'accession_number': filename.split('/')[-1].replace('.txt', '') if filename else ''
+            })
     
     return filings
 
